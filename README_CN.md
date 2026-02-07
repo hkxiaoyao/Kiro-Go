@@ -207,8 +207,13 @@ curl http://localhost:8080/v1/messages \
 | `GET /v1/models` | 模型列表 |
 | `POST /v1/messages` | Claude Messages API |
 | `POST /v1/messages/count_tokens` | Token 计数 |
+| `POST /cc/v1/messages` | Claude Code 流式（缓冲后返回，确保 input_tokens 准确） |
+| `POST /cc/v1/messages/count_tokens` | Token 计数（Claude Code） |
 | `POST /v1/chat/completions` | OpenAI Chat API |
 | `GET /admin` | 管理面板 |
+
+> `/cc/v1/messages` 会缓冲上游事件，在返回 `message_start` 时写入最终 `input_tokens`。
+> 缓冲期间每 25 秒发送一次 `ping` 事件用于保活。
 
 ## 项目结构
 

@@ -207,8 +207,13 @@ Configure thinking mode in the Admin Panel under **Settings > Thinking Mode Sett
 | `GET /v1/models` | List models |
 | `POST /v1/messages` | Claude Messages API |
 | `POST /v1/messages/count_tokens` | Token counting |
+| `POST /cc/v1/messages` | Claude Code streaming (buffered for accurate input_tokens) |
+| `POST /cc/v1/messages/count_tokens` | Token counting (Claude Code) |
 | `POST /v1/chat/completions` | OpenAI Chat API |
 | `GET /admin` | Admin panel |
+
+> `/cc/v1/messages` buffers upstream events and sends `message_start` with the final `input_tokens`.
+> While buffering, the server emits `ping` events every 25 seconds to keep the connection alive.
 
 ## Project Structure
 

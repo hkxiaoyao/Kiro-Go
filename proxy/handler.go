@@ -157,7 +157,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleClaudeMessages(w, r)
+	case path == "/cc/v1/messages":
+		if !h.validateApiKey(r) {
+			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
+		h.handleClaudeMessagesCC(w, r)
 	case path == "/v1/messages/count_tokens" || path == "/messages/count_tokens":
+		if !h.validateApiKey(r) {
+			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
+			return
+		}
+		h.handleCountTokens(w, r)
+	case path == "/cc/v1/messages/count_tokens":
 		if !h.validateApiKey(r) {
 			h.sendClaudeError(w, 401, "authentication_error", "Invalid or missing API key")
 			return
@@ -340,6 +352,50 @@ func (h *Handler) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	// 流式或非流式
 	if req.Stream {
 		h.handleClaudeStream(w, account, kiroPayload, req.Model)
+	} else {
+		h.handleClaudeNonStream(w, account, kiroPayload, req.Model)
+	}
+}
+
+// handleClaudeMessagesCC Claude Code 兼容端点
+func (h *Handler) handleClaudeMessagesCC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method Not Allowed", 405)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		h.sendClaudeError(w, 400, "invalid_request_error", "Failed to read request body")
+		return
+	}
+
+	var req ClaudeRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		h.sendClaudeError(w, 400, "invalid_request_error", "Invalid JSON: "+err.Error())
+		return
+	}
+
+	account := h.pool.GetNext()
+	if account == nil {
+		h.sendClaudeError(w, 503, "api_error", "No available accounts")
+		return
+	}
+
+	if err := h.ensureValidToken(account); err != nil {
+		h.sendClaudeError(w, 503, "api_error", "Token refresh failed: "+err.Error())
+		return
+	}
+
+	// 解析模型和 thinking 模式
+	thinkingCfg := config.GetThinkingConfig()
+	actualModel, thinking := ParseModelAndThinking(req.Model, thinkingCfg.Suffix)
+	req.Model = actualModel
+
+	kiroPayload := ClaudeToKiro(&req, thinking)
+
+	if req.Stream {
+		h.handleClaudeStreamBuffered(w, account, kiroPayload, req.Model)
 	} else {
 		h.handleClaudeNonStream(w, account, kiroPayload, req.Model)
 	}
@@ -622,6 +678,323 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, account *config.Acco
 	}
 
 	// 发送 message_delta
+	stopReason := "end_turn"
+	if len(toolUses) > 0 {
+		stopReason = "tool_use"
+	}
+
+	h.sendSSE(w, flusher, "message_delta", map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason": stopReason,
+		},
+		"usage": map[string]int{
+			"input_tokens":  inputTokens,
+			"output_tokens": outputTokens,
+		},
+	})
+
+	h.sendSSE(w, flusher, "message_stop", map[string]interface{}{
+		"type": "message_stop",
+	})
+}
+
+// handleClaudeStreamBuffered Claude Code 流式响应（缓冲模式，确保 input_tokens 准确）
+func (h *Handler) handleClaudeStreamBuffered(w http.ResponseWriter, account *config.Account, payload *KiroPayload, model string) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.sendClaudeError(w, 500, "api_error", "Streaming not supported")
+		return
+	}
+
+	type bufferedEvent struct {
+		event string
+		data  interface{}
+	}
+
+	var buffer []bufferedEvent
+	bufferEvent := func(event string, data interface{}) {
+		buffer = append(buffer, bufferedEvent{event: event, data: data})
+	}
+
+	// 定时发送 ping 保活（等待上游完成后再返回）
+	stopPing := make(chan struct{})
+	donePing := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		defer close(donePing)
+		for {
+			select {
+			case <-ticker.C:
+				h.sendSSE(w, flusher, "ping", map[string]string{"type": "ping"})
+			case <-stopPing:
+				return
+			}
+		}
+	}()
+
+	thinkingFormat := config.GetThinkingConfig().ClaudeFormat
+
+	msgID := "msg_" + uuid.New().String()
+	var contentStarted bool
+	var toolUseIndex int
+	var inputTokens, outputTokens int
+	var credits float64
+	var toolUses []KiroToolUse
+
+	var textBuffer string
+	var inThinkingBlock bool
+	var thinkingStarted bool
+
+	sendText := func(text string, thinkingState int) {
+		if !contentStarted {
+			bufferEvent("content_block_start", map[string]interface{}{
+				"type":          "content_block_start",
+				"index":         0,
+				"content_block": map[string]string{"type": "text", "text": ""},
+			})
+			contentStarted = true
+		}
+
+		if thinkingState == 0 {
+			if text == "" {
+				return
+			}
+			bufferEvent("content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": 0,
+				"delta": map[string]string{"type": "text_delta", "text": text},
+			})
+			return
+		}
+
+		var outputText string
+		switch thinkingFormat {
+		case "think":
+			switch thinkingState {
+			case 1:
+				outputText = "<think>" + text
+			case 2:
+				outputText = text
+			case 3:
+				outputText = text + "</think>"
+			}
+		case "reasoning_content":
+			outputText = text
+		default:
+			switch thinkingState {
+			case 1:
+				outputText = "<thinking>" + text
+			case 2:
+				outputText = text
+			case 3:
+				outputText = text + "</thinking>"
+			}
+		}
+		if outputText == "" {
+			return
+		}
+		bufferEvent("content_block_delta", map[string]interface{}{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]string{"type": "text_delta", "text": outputText},
+		})
+	}
+
+	processClaudeText := func(text string, isThinking bool, forceFlush bool) {
+		if isThinking {
+			if !thinkingStarted {
+				sendText(text, 1)
+				thinkingStarted = true
+			} else {
+				sendText(text, 2)
+			}
+			return
+		}
+
+		textBuffer += text
+
+		for {
+			if !inThinkingBlock {
+				thinkingStart := strings.Index(textBuffer, "<thinking>")
+				if thinkingStart != -1 {
+					if thinkingStart > 0 {
+						sendText(textBuffer[:thinkingStart], 0)
+					}
+					textBuffer = textBuffer[thinkingStart+10:]
+					inThinkingBlock = true
+					thinkingStarted = false
+				} else if forceFlush || len([]rune(textBuffer)) > 50 {
+					runes := []rune(textBuffer)
+					safeLen := len(runes)
+					if !forceFlush {
+						safeLen = max(0, len(runes)-15)
+					}
+					if safeLen > 0 {
+						sendText(string(runes[:safeLen]), 0)
+						textBuffer = string(runes[safeLen:])
+					}
+					break
+				} else {
+					break
+				}
+			} else {
+				thinkingEnd := strings.Index(textBuffer, "</thinking>")
+				if thinkingEnd != -1 {
+					content := textBuffer[:thinkingEnd]
+					if !thinkingStarted {
+						sendText(content, 1)
+						sendText("", 3)
+					} else {
+						sendText(content, 3)
+					}
+					textBuffer = textBuffer[thinkingEnd+11:]
+					inThinkingBlock = false
+					thinkingStarted = false
+				} else if forceFlush {
+					if textBuffer != "" {
+						if !thinkingStarted {
+							sendText(textBuffer, 1)
+							sendText("", 3)
+						} else {
+							sendText(textBuffer, 3)
+						}
+						textBuffer = ""
+					}
+					break
+				} else {
+					runes := []rune(textBuffer)
+					if len(runes) > 20 {
+						safeLen := len(runes) - 15
+						if safeLen > 0 {
+							if !thinkingStarted {
+								sendText(string(runes[:safeLen]), 1)
+								thinkingStarted = true
+							} else {
+								sendText(string(runes[:safeLen]), 2)
+							}
+							textBuffer = string(runes[safeLen:])
+						}
+					}
+					break
+				}
+			}
+		}
+	}
+
+	callback := &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if text == "" {
+				return
+			}
+			processClaudeText(text, isThinking, false)
+		},
+		OnToolUse: func(tu KiroToolUse) {
+			processClaudeText("", false, true)
+
+			toolUses = append(toolUses, tu)
+
+			if contentStarted && toolUseIndex == 0 {
+				bufferEvent("content_block_stop", map[string]interface{}{
+					"type":  "content_block_stop",
+					"index": 0,
+				})
+			}
+
+			idx := toolUseIndex
+			if contentStarted {
+				idx = toolUseIndex + 1
+			}
+			toolUseIndex++
+
+			bufferEvent("content_block_start", map[string]interface{}{
+				"type":  "content_block_start",
+				"index": idx,
+				"content_block": map[string]interface{}{
+					"type":  "tool_use",
+					"id":    tu.ToolUseID,
+					"name":  tu.Name,
+					"input": map[string]interface{}{},
+				},
+			})
+
+			inputJSON, _ := json.Marshal(tu.Input)
+			bufferEvent("content_block_delta", map[string]interface{}{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]interface{}{
+					"type":         "input_json_delta",
+					"partial_json": string(inputJSON),
+				},
+			})
+
+			bufferEvent("content_block_stop", map[string]interface{}{
+				"type":  "content_block_stop",
+				"index": idx,
+			})
+		},
+		OnComplete: func(inTok, outTok int) {
+			inputTokens = inTok
+			outputTokens = outTok
+		},
+		OnError: func(err error) {
+			h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
+		},
+		OnCredits: func(c float64) {
+			credits = c
+		},
+	}
+
+	err := CallKiroAPI(account, payload, callback)
+	close(stopPing)
+	<-donePing
+	if err != nil {
+		h.recordFailure()
+		h.pool.RecordError(account.ID, strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "quota"))
+		h.sendSSE(w, flusher, "error", map[string]interface{}{
+			"type":  "error",
+			"error": map[string]string{"type": "api_error", "message": err.Error()},
+		})
+		return
+	}
+
+	processClaudeText("", false, true)
+
+	h.recordSuccess(inputTokens, outputTokens, credits)
+	h.pool.RecordSuccess(account.ID)
+	h.pool.UpdateStats(account.ID, inputTokens+outputTokens, credits)
+
+	h.sendSSE(w, flusher, "message_start", map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id":      msgID,
+			"type":    "message",
+			"role":    "assistant",
+			"content": []interface{}{},
+			"model":   model,
+			"usage": map[string]int{
+				"input_tokens":  inputTokens,
+				"output_tokens": 0,
+			},
+		},
+	})
+
+	for _, event := range buffer {
+		h.sendSSE(w, flusher, event.event, event.data)
+	}
+
+	if contentStarted && toolUseIndex == 0 {
+		h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": 0,
+		})
+	}
+
 	stopReason := "end_turn"
 	if len(toolUses) > 0 {
 		stopReason = "tool_use"
@@ -1316,20 +1689,20 @@ func (h *Handler) apiGetAccounts(w http.ResponseWriter, r *http.Request) {
 			"expiresAt":         a.ExpiresAt,
 			"hasToken":          a.AccessToken != "",
 			"machineId":         a.MachineId,
-			"subscriptionType":    a.SubscriptionType,
-			"subscriptionTitle":   a.SubscriptionTitle,
-			"daysRemaining":       a.DaysRemaining,
-			"usageCurrent":        a.UsageCurrent,
-			"usageLimit":          a.UsageLimit,
-			"usagePercent":        a.UsagePercent,
-			"nextResetDate":       a.NextResetDate,
-			"lastRefresh":         a.LastRefresh,
-			"trialUsageCurrent":   a.TrialUsageCurrent,
-			"trialUsageLimit":     a.TrialUsageLimit,
-			"trialUsagePercent":   a.TrialUsagePercent,
-			"trialStatus":         a.TrialStatus,
-			"trialExpiresAt":      a.TrialExpiresAt,
-			"requestCount":        stats.RequestCount,
+			"subscriptionType":  a.SubscriptionType,
+			"subscriptionTitle": a.SubscriptionTitle,
+			"daysRemaining":     a.DaysRemaining,
+			"usageCurrent":      a.UsageCurrent,
+			"usageLimit":        a.UsageLimit,
+			"usagePercent":      a.UsagePercent,
+			"nextResetDate":     a.NextResetDate,
+			"lastRefresh":       a.LastRefresh,
+			"trialUsageCurrent": a.TrialUsageCurrent,
+			"trialUsageLimit":   a.TrialUsageLimit,
+			"trialUsagePercent": a.TrialUsagePercent,
+			"trialStatus":       a.TrialStatus,
+			"trialExpiresAt":    a.TrialExpiresAt,
+			"requestCount":      stats.RequestCount,
 			"errorCount":        stats.ErrorCount,
 			"totalTokens":       stats.TotalTokens,
 			"totalCredits":      stats.TotalCredits,
