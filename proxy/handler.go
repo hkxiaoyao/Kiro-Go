@@ -1204,6 +1204,11 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, account *config.Acco
 			"delta":         map[string]interface{}{},
 			"finish_reason": finishReason,
 		}},
+		"usage": map[string]int{
+			"prompt_tokens":     inputTokens,
+			"completion_tokens": outputTokens,
+			"total_tokens":      inputTokens + outputTokens,
+		},
 	}
 	data, _ := json.Marshal(chunk)
 	fmt.Fprintf(w, "data: %s\n\n", string(data))
